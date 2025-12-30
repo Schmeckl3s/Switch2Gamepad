@@ -220,54 +220,42 @@ class Switch2ControllerService : Service() {
                 val hex = data.joinToString(" ") { "%02x".format(it) }
 
                 if (characteristic.uuid == COMMAND_RESPONSE_UUID) {
-                    Log.d(TAG, "SUBCMD REPLY from c765a961...: $hex")  // Turn this ON!
+                    Log.d(TAG, "SUBCMD REPLY from c765a961...: $hex (length: ${data.size})")
 
-                    if (data.size >= 16) {
+                    // The reply starts with the echoed subcmd (0x02 for SPI read)
+                    if (data.size >= 20 && data[0] == 0x02.toByte()) {
+                        val dataLen = data[8].toInt() and 0xFF
                         val readAddress = (data[15].toInt() and 0xFF shl 24) or
                                 (data[14].toInt() and 0xFF shl 16) or
                                 (data[13].toInt() and 0xFF shl 8) or
-                                (data[12].toInt() and 0xFF)  // <I little-endian
+                                (data[12].toInt() and 0xFF)
 
-                        val dataLen = data[8].toInt() and 0xFF
+                        Log.d(TAG, "SPI READ REPLY -> address: 0x${readAddress.toString(16).uppercase()} length: $dataLen")
+
                         if (data.size >= 16 + dataLen) {
                             val payload = data.sliceArray(16 until 16 + dataLen)
-
-                            Log.d(TAG, "SPI read from 0x${readAddress.toString(16)} ($dataLen bytes)")
 
                             when (readAddress) {
                                 0x13000 -> {
                                     val serialBytes = payload.sliceArray(0x02 until 0x12)
                                     val serial = serialBytes.toString(Charsets.UTF_8).trimEnd('\u0000')
-                                    val vendorId = (payload[0x13].toInt() and 0xFF shl 8) or (payload[0x12].toInt() and 0xFF)
-                                    val productId = (payload[0x15].toInt() and 0xFF shl 8) or (payload[0x14].toInt() and 0xFF)
-
-                                    Log.d(TAG, "Device Info:")
-                                    Log.d(TAG, "  Serial: $serial")
-                                    Log.d(TAG, "  Vendor ID: 0x${vendorId.toString(16)}")
-                                    Log.d(TAG, "  Product ID: 0x${productId.toString(16)}")
-                                    // Colours: payload[0x19:0x1C] body, 0x1C:0x1F buttons, etc.
+                                    Log.d(TAG, "=== DEVICE INFO ===")
+                                    Log.d(TAG, "Serial: $serial")
                                 }
                                 0x1FA000 -> {
-                                    val host1Bytes = payload.sliceArray(0x08 until 0x0E)
-                                    val host2Bytes = payload.sliceArray(0x30 until 0x36)
-                                    val ltkBytes = payload.sliceArray(0x1A until 0x2A).reversedArray()  // [::-1]
+                                    val host1 = payload.sliceArray(0x08 until 0x0E).joinToString("") { "%02x".format(it) }
+                                    val host2 = payload.sliceArray(0x30 until 0x36).joinToString("") { "%02x".format(it) }
+                                    val ltkBytes = payload.sliceArray(0x1A until 0x2A).reversedArray()
+                                    val ltk = ltkBytes.joinToString("") { "%02x".format(it) }
 
-                                    Log.d(TAG, "host address #1: ${host1Bytes.joinToString("") { "%02x".format(it) }}")
-                                    Log.d(TAG, "host address #2: ${host2Bytes.joinToString("") { "%02x".format(it) }}")
-                                    Log.d(TAG, "LTK: ${ltkBytes.joinToString("") { "%02x".format(it) }}")
-                                }
-                                // Add stick cal parsing if wanted (0x13080, 0x130C0, 0x1FC040)
-                                else -> {
-                                    // Optional: log other addresses
+                                    Log.d(TAG, "=== PAIRING DATA ===")
+                                    Log.d(TAG, "host address #1: $host1")
+                                    Log.d(TAG, "host address #2: $host2")
+                                    Log.d(TAG, "LTK: $ltk")
                                 }
                             }
-                        } else {
-                            Log.w(TAG, "Truncated SPI payload (len $dataLen, got ${data.size - 16} bytes) — increase MTU!")
                         }
                     }
-                } else if (characteristic.uuid == INPUT_REPORT_UUID_1) {
-                    // Keep inputs suppressed to avoid flood
-                    // Optional: Log only on button press or stick move for debugging
                 }
             }
         })
@@ -419,6 +407,7 @@ class Switch2ControllerService : Service() {
         if (subcommandQueue.isNotEmpty()) {
             val (subcmd, data) = subcommandQueue.removeAt(0)
             sendSubcommand(gatt, subcmd, data)
+
         } else {
             updateNotification("All gist commands sent — test input!")
         }
@@ -427,23 +416,50 @@ class Switch2ControllerService : Service() {
     private fun sendSubcommandSequence(gatt: BluetoothGatt) {
         subcommandQueue.clear()
 
-        // 1. Initial connection vibration sample (index 0x03 - exact from gist)
-        subcommandQueue.add(Pair(0x0A.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x03.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+        // 1. Features config first (0xFF = all available)
+        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(
+            0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(),
+            0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0xFF.toByte()
+        )))
 
-        // Gist order: LEDs first (mask 0b0110 = 0x06 for example)
-        subcommandQueue.add(Pair(0x09.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x07.toByte(), 0x00.toByte(), 0x08.toByte(), 0x00.toByte(), 0x00.toByte(), 0x06.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+        // 2. Enable features (0x37 = full Joy-Con support)
+        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(
+            0x91.toByte(), 0x01.toByte(), 0x04.toByte(), 0x00.toByte(),
+            0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x37.toByte()
+        )))
 
-        // Features config (0xFF all)
-        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0xFF.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+        // 3. Set player LEDs (mask 0x06 works reliably)
+        subcommandQueue.add(Pair(0x09.toByte(), byteArrayOf(
+            0x91.toByte(), 0x01.toByte(), 0x07.toByte(), 0x00.toByte(),
+            0x08.toByte(), 0x00.toByte(), 0x00.toByte(), 0x06.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte()
+        )))
 
-        // Features enable (0x37 for Joy-Con full: IMU/vibe/etc.)
-        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x04.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x37.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+        // 4. Connection vibration sample
+        subcommandQueue.add(Pair(0x0A.toByte(), byteArrayOf(
+            0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(),
+            0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x03.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte()
+        )))
+
+        // 5. Get version
+        subcommandQueue.add(Pair(0x10.toByte(), byteArrayOf(
+            0x91.toByte(), 0x01.toByte(), 0x01.toByte(), 0x00.toByte(),
+            0x00.toByte(), 0x00.toByte(), 0x00.toByte()
+        )))
 
         // Vibration sample (index 0x03)
         //subcommandQueue.add(Pair(0x0A.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x03.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
 
         // Version
         subcommandQueue.add(Pair(0x10.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x01.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+
+        // Device info (serial, product ID)
+        subcommandQueue.add(Pair(0x02.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x04.toByte(), 0x00.toByte(), 0x08.toByte(), 0x00.toByte(), 0x00.toByte(), 0x40.toByte(), 0x7E.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x30.toByte(), 0x01.toByte(), 0x00.toByte())))
+
+        // Pairing data (host addresses + LTK) — this is the one for your gist
+        subcommandQueue.add(Pair(0x02.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x04.toByte(), 0x00.toByte(), 0x08.toByte(), 0x00.toByte(), 0x00.toByte(), 0x40.toByte(), 0x7E.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0xA0.toByte(), 0x1F.toByte(), 0x00.toByte())))
 
         sendNextSubcommand(gatt)
     }
