@@ -11,7 +11,11 @@ import android.util.Log
 
 class MainActivity : AppCompatActivity() {
     private val REQUEST_CODE = 1
-    private val TAG = "MainActivity"
+
+    private val REQUIRED_PERMISSIONS = arrayOf(
+        Manifest.permission.BLUETOOTH_CONNECT,
+        Manifest.permission.BLUETOOTH_SCAN
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -24,28 +28,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkBluetoothPermissions(): Boolean {
-        val connect = ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-        val scan = ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-        Log.d(TAG, "Permissions check: CONNECT=$connect, SCAN=$scan")
-        return connect && scan
+        return REQUIRED_PERMISSIONS.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun requestBluetoothPermissions() {
-        Log.d(TAG, "Requesting Bluetooth permissions")
-        ActivityCompat.requestPermissions(this, arrayOf(
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.BLUETOOTH_SCAN
-        ), REQUEST_CODE)
+        ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE && grantResults.size == 2 && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            Log.d(TAG, "Permissions granted – starting service")
+        if (requestCode == REQUEST_CODE && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
             startTheService()
         } else {
-            Log.e(TAG, "Permissions denied – can't start service")
-            finish()  // Close app if denied
+            Log.e("MainActivity", "Permissions denied")
+            // Show explanation
         }
     }
 
