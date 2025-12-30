@@ -31,9 +31,31 @@ class Switch2ControllerService : Service() {
     private val TAG = "Switch2Service"
     private val CHANNEL_ID = "switch2_channel"
 
+    private val SERVICE_UUID = UUID.fromString("ab7de9be-89fe-49ad-828f-118f09df7fd0")
+    private val INPUT_REPORT_UUID_1 = UUID.fromString("ab7de9be-89fe-49ad-828f-118f09df7fd2") // Primary input
+    private val INPUT_REPORT_UUID_2 = UUID.fromString("cc1bbbb5-7354-4d32-a716-a81cb241a32a") // Secondary input
+    private val CUSTOM_DESCRIPTOR_UUID = UUID.fromString("679d5510-5a24-4dee-9557-95df80486ecb")
+    private val OUTPUT_REPORT_UUID = UUID.fromString("649d4ac9-8eb7-4e6c-af44-1ea54fe5f005") // For subcommands (gist command_handle 0x0016 value
+    private val COMMAND_RESPONSE_UUID = UUID.fromString("c765a961-d9d8-4d36-a20a-5315b111836a") // For subcmd replies (gist 0x001A-1=0x0019)
+    private val VIBRATION_OUTPUT_UUID = UUID.fromString("289326cb-a471-485d-a8f4-240c14f18241")  // Handle ~0x0012 value
+    private val pairingSpiData = mutableListOf<ByteArray>() // To combine SPI chunks
+    private val subcommandQueue: MutableList<Pair<Byte, ByteArray>> = mutableListOf() // List of (subcmd, data)
+    private var timer: Byte = 0
+    private var configState: Int = 0
+    private var mainService: BluetoothGattService? = null
+
+    // For chunked SPI pairing read
+    private val pairingSpiChunks = mutableListOf<ByteArray>()
+    private val pairingAddress = 0x1FA000L // Gist uses this for Switch 2
+
+    private var gatt: BluetoothGatt? = null
+
+
     private var bluetoothGatt: BluetoothGatt? = null
     private var inputCharacteristic: BluetoothGattCharacteristic? = null
     private var commandCharacteristic: BluetoothGattCharacteristic? = null
+
+    private var isPaired = true
 
     private val CLIENT_CONFIG_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
@@ -128,9 +150,8 @@ class Switch2ControllerService : Service() {
         bluetoothGatt = device.connectGatt(this, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    Log.d(TAG, "Connected — Discovering services")
-                    updateNotification("Connected")
-                    gatt.discoverServices()
+                    Log.d(TAG, "Connected — Requesting MTU")
+                    gatt.requestMtu(517)  // Max BLE MTU for large replies
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.e(TAG, "Disconnected")
                     updateNotification("Disconnected")
@@ -139,26 +160,114 @@ class Switch2ControllerService : Service() {
                 }
             }
 
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "MTU set to $mtu — Discovering services")
+                    gatt.discoverServices()
+                } else {
+                    Log.e(TAG, "MTU request failed: $status — Discovering anyway")
+                    gatt.discoverServices()
+                }
+            }
+
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     logAllCharacteristics(gatt)
-                    setupGistSequence(gatt)
+                    Log.d(TAG, "Chars found — starting exact gist sequence")
+                    mainService = gatt.getService(SERVICE_UUID)
+                    if (mainService == null) {
+                        Log.e(TAG, "Main service not found")
+                        return
+                    }
+                    configureInputReports(gatt)
                     updateNotification("Configured — Move stick/press buttons")
+                }
+            }
+
+            override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "Descriptor write success for ${descriptor.uuid}")
+                    if (descriptor.uuid == CUSTOM_DESCRIPTOR_UUID) {
+                        if (configState == 1) {
+                            configureSecondInputReport(gatt)
+                        } else if (configState == 2) {
+                            enableCommandResponseNotifications(gatt) // NEW: Enable command response before input
+                        }
+                    } else if (descriptor.uuid == CLIENT_CONFIG_UUID) {
+                        if (configState == 3) { // Command response CCCD
+                            enableNotifications(gatt) // Input CCCD
+                        } else if (configState == 4) { // Input CCCD done
+                            Log.d(TAG, "All notifications enabled — starting gist subcommand sequence")
+                            sendSubcommandSequence(gatt)
+                        }
+                    }
+                } else {
+                    Log.e(TAG, "Descriptor write failed: $status")
+                }
+            }
+
+            override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.d(TAG, "Subcommand write success for ${characteristic.uuid}")
+                    sendNextSubcommand(gatt) // Send next from queue
+                } else {
+                    Log.e(TAG, "Subcommand write failed: $status")
                 }
             }
 
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 val data = characteristic.value ?: return
                 val hex = data.joinToString(" ") { "%02x".format(it) }
-                Log.d(TAG, "REPORT from ${characteristic.uuid}: $hex")
 
-                if (data.size >= 0x30 && data[0].toInt() == 0x10) {
-                    val ltk = data.sliceArray(0x1A until 0x2A).reversedArray().joinToString("") { "%02x".format(it) }
-                    val host1 = data.sliceArray(0x30 until 0x36).joinToString("") { "%02x".format(it) }
-                    val host2 = data.sliceArray(0x36 until 0x3C).joinToString("") { "%02x".format(it) }
-                    Log.d(TAG, "LTK: $ltk")
-                    Log.d(TAG, "Host Address 1: $host1")
-                    Log.d(TAG, "Host Address 2: $host2")
+                if (characteristic.uuid == COMMAND_RESPONSE_UUID) {
+                    Log.d(TAG, "SUBCMD REPLY from c765a961...: $hex")  // Turn this ON!
+
+                    if (data.size >= 16) {
+                        val readAddress = (data[15].toInt() and 0xFF shl 24) or
+                                (data[14].toInt() and 0xFF shl 16) or
+                                (data[13].toInt() and 0xFF shl 8) or
+                                (data[12].toInt() and 0xFF)  // <I little-endian
+
+                        val dataLen = data[8].toInt() and 0xFF
+                        if (data.size >= 16 + dataLen) {
+                            val payload = data.sliceArray(16 until 16 + dataLen)
+
+                            Log.d(TAG, "SPI read from 0x${readAddress.toString(16)} ($dataLen bytes)")
+
+                            when (readAddress) {
+                                0x13000 -> {
+                                    val serialBytes = payload.sliceArray(0x02 until 0x12)
+                                    val serial = serialBytes.toString(Charsets.UTF_8).trimEnd('\u0000')
+                                    val vendorId = (payload[0x13].toInt() and 0xFF shl 8) or (payload[0x12].toInt() and 0xFF)
+                                    val productId = (payload[0x15].toInt() and 0xFF shl 8) or (payload[0x14].toInt() and 0xFF)
+
+                                    Log.d(TAG, "Device Info:")
+                                    Log.d(TAG, "  Serial: $serial")
+                                    Log.d(TAG, "  Vendor ID: 0x${vendorId.toString(16)}")
+                                    Log.d(TAG, "  Product ID: 0x${productId.toString(16)}")
+                                    // Colours: payload[0x19:0x1C] body, 0x1C:0x1F buttons, etc.
+                                }
+                                0x1FA000 -> {
+                                    val host1Bytes = payload.sliceArray(0x08 until 0x0E)
+                                    val host2Bytes = payload.sliceArray(0x30 until 0x36)
+                                    val ltkBytes = payload.sliceArray(0x1A until 0x2A).reversedArray()  // [::-1]
+
+                                    Log.d(TAG, "host address #1: ${host1Bytes.joinToString("") { "%02x".format(it) }}")
+                                    Log.d(TAG, "host address #2: ${host2Bytes.joinToString("") { "%02x".format(it) }}")
+                                    Log.d(TAG, "LTK: ${ltkBytes.joinToString("") { "%02x".format(it) }}")
+                                }
+                                // Add stick cal parsing if wanted (0x13080, 0x130C0, 0x1FC040)
+                                else -> {
+                                    // Optional: log other addresses
+                                }
+                            }
+                        } else {
+                            Log.w(TAG, "Truncated SPI payload (len $dataLen, got ${data.size - 16} bytes) — increase MTU!")
+                        }
+                    }
+                } else if (characteristic.uuid == INPUT_REPORT_UUID_1) {
+                    // Keep inputs suppressed to avoid flood
+                    // Optional: Log only on button press or stick move for debugging
                 }
             }
         })
@@ -202,85 +311,141 @@ class Switch2ControllerService : Service() {
         Log.d(TAG, "=========================================")
     }
 
-    private fun setupGistSequence(gatt: BluetoothGatt) {
-        // Main service
-        val mainService = gatt.getService(UUID.fromString("00c5af5d-1964-4e30-8f51-1956f96bd280"))
-        if (mainService == null) {
-            Log.e(TAG, "Main service not found")
+    private fun configureInputReports(gatt: BluetoothGatt) {
+        val inputChar1 = mainService!!.getCharacteristic(INPUT_REPORT_UUID_1)
+        if (inputChar1 == null) {
+            Log.e(TAG, "Input char1 not found")
             return
         }
-
-        // Command char: exact UUID from your log
-        commandCharacteristic = mainService.characteristics.find {
-            it.uuid == UUID.fromString("00c5af5d-1964-4e30-8f51-1956f96bd282")
-        }
-
-        // Input char: exact UUID from your log (primary NOTIFY with CCCD)
-        inputCharacteristic = gatt.services.flatMap { it.characteristics }.find {
-            it.uuid == UUID.fromString("ab7de9be-89fe-49ad-828f-118f09df7fd2")
-        }
-
-        if (inputCharacteristic == null || commandCharacteristic == null) {
-            Log.e(TAG, "Chars not found — check UUIDs")
+        val customDesc1 = inputChar1.getDescriptor(CUSTOM_DESCRIPTOR_UUID)
+        if (customDesc1 == null) {
+            Log.e(TAG, "Custom desc1 not found")
             return
         }
+        customDesc1.value = byteArrayOf(0x85.toByte(), 0x00.toByte())
+        if (gatt.writeDescriptor(customDesc1)) {
+            Log.d(TAG, "Writing 0x8500 to custom descriptor for input report 1")
+            configState = 1
+        } else {
+            Log.e(TAG, "Failed to initiate write to custom desc1")
+        }
+    }
 
-        Log.d(TAG, "Chars found — starting exact gist sequence")
+    private fun configureSecondInputReport(gatt: BluetoothGatt) {
+        val inputChar2 = mainService!!.getCharacteristic(INPUT_REPORT_UUID_2)
+        if (inputChar2 == null) {
+            enableNotifications(gatt)
+            return
+        }
+        val customDesc2 = inputChar2.getDescriptor(CUSTOM_DESCRIPTOR_UUID)
+        if (customDesc2 == null) {
+            enableNotifications(gatt)
+            return
+        }
+        customDesc2.value = byteArrayOf(0x85.toByte(), 0x00.toByte())
+        if (gatt.writeDescriptor(customDesc2)) {
+            Log.d(TAG, "Writing 0x8500 to custom descriptor for input report 2")
+            configState = 2
+        } else {
+            Log.e(TAG, "Failed to initiate write to custom desc2")
+            enableNotifications(gatt)
+        }
+    }
 
-        // 1. Report mode 0x30
-        val modeCmd = byteArrayOf(0x03.toByte(), 0x30.toByte())
-        commandCharacteristic!!.value = modeCmd
-        gatt.writeCharacteristic(commandCharacteristic)
-        Log.d(TAG, "Sent report mode 0x30")
-
-        // 2. Enable notifications
-        gatt.setCharacteristicNotification(inputCharacteristic, true)
-
-        // 3. CCCD enable
+    private fun enableNotifications(gatt: BluetoothGatt) {
+        inputCharacteristic = mainService!!.getCharacteristic(INPUT_REPORT_UUID_1)
+        if (inputCharacteristic == null) {
+            Log.e(TAG, "Input char1 not found")
+            return
+        }
+        gatt.setCharacteristicNotification(inputCharacteristic!!, true)
         val cccd = inputCharacteristic!!.getDescriptor(CLIENT_CONFIG_UUID)
-        if (cccd != null) {
-            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            gatt.writeDescriptor(cccd)
-            Log.d(TAG, "CCCD enabled")
+        if (cccd == null) {
+            Log.e(TAG, "CCCD not found")
+            return
+        }
+        cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        if (gatt.writeDescriptor(cccd)) {
+            Log.d(TAG, "Enabling CCCD for notifications")
+            configState = 4
+        } else {
+            Log.e(TAG, "Failed to initiate CCCD write")
+        }
+    }
+    private fun enableCommandResponseNotifications(gatt: BluetoothGatt) {
+        val cmdResponseChar = mainService!!.getCharacteristic(COMMAND_RESPONSE_UUID)
+        if (cmdResponseChar == null) {
+            Log.e(TAG, "Command response char not found")
+            enableNotifications(gatt) // Proceed anyway
+            return
+        }
+        gatt.setCharacteristicNotification(cmdResponseChar, true)
+        val cccd = cmdResponseChar.getDescriptor(CLIENT_CONFIG_UUID)
+        if (cccd == null) {
+            Log.e(TAG, "Command response CCCD not found")
+            enableNotifications(gatt)
+            return
+        }
+        cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        if (gatt.writeDescriptor(cccd)) {
+            Log.d(TAG, "Enabling CCCD for command response notifications")
+            configState = 3
+        } else {
+            Log.e(TAG, "Failed to initiate command response CCCD write")
+            enableNotifications(gatt)
+        }
+    }
+
+    private fun sendSubcommand(gatt: BluetoothGatt, subcmd: Byte, data: ByteArray = byteArrayOf()) {
+        val outputChar = mainService!!.getCharacteristic(OUTPUT_REPORT_UUID)
+        if (outputChar == null) {
+            Log.e(TAG, "Correct output char not found - check UUID")
+            return
         }
 
-        // 4. Report rate 0x8500 (second descriptor on input char)
-        val rateDesc = inputCharacteristic!!.descriptors.getOrNull(1)
-        if (rateDesc != null) {
-            rateDesc.value = byteArrayOf(0x85.toByte(), 0x00.toByte())
-            gatt.writeDescriptor(rateDesc)
-            Log.d(TAG, "Report rate set")
+        val packet = byteArrayOf(subcmd) + data  // Direct: subcmd first, then data bytes
+
+        // NO 33-byte padding for this characteristic
+        outputChar.value = packet
+        outputChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        if (gatt.writeCharacteristic(outputChar)) {
+            Log.d(TAG, "Sent subcommand 0x${"%02x".format(subcmd)} with data: ${data.joinToString(" ") { "%02x".format(it) }} to correct char")
+        } else {
+            Log.e(TAG, "Failed to send subcommand 0x${"%02x".format(subcmd)}")
         }
+    }
 
-        // 5. Feature enable (exact gist bytes)
-        val featureCmd = byteArrayOf(
-            0x0c.toByte(), 0x91.toByte(), 0x01.toByte(), 0x04.toByte(),
-            0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(),
-            0xFF.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte()
-        )
-        commandCharacteristic!!.value = featureCmd
-        gatt.writeCharacteristic(commandCharacteristic)
-        Log.d(TAG, "Feature enable sent")
+    private fun sendNextSubcommand(gatt: BluetoothGatt) {
+        if (subcommandQueue.isNotEmpty()) {
+            val (subcmd, data) = subcommandQueue.removeAt(0)
+            sendSubcommand(gatt, subcmd, data)
+        } else {
+            updateNotification("All gist commands sent — test input!")
+        }
+    }
 
-        // 6. LED (player 1)
-        val ledCmd = byteArrayOf(0x09.toByte(), 0x01.toByte())
-        commandCharacteristic!!.value = ledCmd
-        gatt.writeCharacteristic(commandCharacteristic)
-        Log.d(TAG, "LED sent")
+    private fun sendSubcommandSequence(gatt: BluetoothGatt) {
+        subcommandQueue.clear()
 
-        // 7. Vibration
-        val vibCmd = byteArrayOf(0x08.toByte(), 0x01.toByte())
-        commandCharacteristic!!.value = vibCmd
-        gatt.writeCharacteristic(commandCharacteristic)
-        Log.d(TAG, "Vibration sent")
+        // 1. Initial connection vibration sample (index 0x03 - exact from gist)
+        subcommandQueue.add(Pair(0x0A.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x03.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
 
-        // 8. SPI dump for LTK/host
-        val spiCmd = byteArrayOf(0x10.toByte(), 0x00.toByte(), 0xA0.toByte(), 0x1F.toByte(), 0x00.toByte(), 0x01.toByte(), 0x00.toByte(), 0x00.toByte())
-        commandCharacteristic!!.value = spiCmd
-        gatt.writeCharacteristic(commandCharacteristic)
-        Log.d(TAG, "SPI dump requested")
+        // Gist order: LEDs first (mask 0b0110 = 0x06 for example)
+        subcommandQueue.add(Pair(0x09.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x07.toByte(), 0x00.toByte(), 0x08.toByte(), 0x00.toByte(), 0x00.toByte(), 0x06.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
 
-        updateNotification("All gist commands sent — test input!")
+        // Features config (0xFF all)
+        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0xFF.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+
+        // Features enable (0x37 for Joy-Con full: IMU/vibe/etc.)
+        subcommandQueue.add(Pair(0x0C.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x04.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x37.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+
+        // Vibration sample (index 0x03)
+        //subcommandQueue.add(Pair(0x0A.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x02.toByte(), 0x00.toByte(), 0x04.toByte(), 0x00.toByte(), 0x00.toByte(), 0x03.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+
+        // Version
+        subcommandQueue.add(Pair(0x10.toByte(), byteArrayOf(0x91.toByte(), 0x01.toByte(), 0x01.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte(), 0x00.toByte())))
+
+        sendNextSubcommand(gatt)
     }
 
     override fun onDestroy() {
