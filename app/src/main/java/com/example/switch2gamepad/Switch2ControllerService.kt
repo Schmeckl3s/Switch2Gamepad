@@ -68,6 +68,8 @@ class Switch2ControllerService : Service() {
     private val NINTENDO_MANUFACTURER_ID = 0x0553
     private val VALID_SWITCH2_PIDS = listOf(0x2066, 0x2067, 0x2069, 0x2073)
 
+    private var controllerName: String = "Unknown"
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
@@ -134,16 +136,21 @@ class Switch2ControllerService : Service() {
 
                 if (vid == 0x057E && pid in VALID_SWITCH2_PIDS) {
                     val device = result.device
-                    Log.d(TAG, "MATCHED Joy-Con (${device.address}) — Connecting...")
-                    updateNotification("Joy-Con found — Connecting...")
+                    val name = device.name ?: "Unknown"
+
+
                     scanner.stopScan(this)
                     connectToDevice(device)
+                    controllerName = name
+                    Log.d(TAG, "MATCHED Nintendo Device  ( ${device.address}, ${controllerName}) — Connecting...")
                 }
+
+
             }
         }
 
         scanner.startScan(listOf(filter), settings, scanCallback)
-        Log.d(TAG, "Scanning for Switch 2 Joy-Cons...")
+        Log.d(TAG, "Scanning for Nintendo Controllers.")
     }
 
     private fun connectToDevice(device: BluetoothDevice) {
@@ -239,8 +246,14 @@ class Switch2ControllerService : Service() {
                                 0x13000 -> {
                                     val serialBytes = payload.sliceArray(0x02 until 0x12)
                                     val serial = serialBytes.toString(Charsets.UTF_8).trimEnd('\u0000')
+                                    val productId = (payload[0x15].toInt() and 0xFF shl 8) or (payload[0x14].toInt() and 0xFF)
+
+
                                     Log.d(TAG, "=== DEVICE INFO ===")
+                                    Log.d(TAG, "Name:$controllerName" )
                                     Log.d(TAG, "Serial: $serial")
+                                    Log.d(TAG, "Product ID: 0x${productId.toString(16).uppercase()}")
+
                                 }
                                 0x1FA000 -> {
                                     val host1 = payload.sliceArray(0x08 until 0x0E).joinToString("") { "%02x".format(it) }
